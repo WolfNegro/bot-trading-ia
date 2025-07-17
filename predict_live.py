@@ -1,4 +1,4 @@
-# predict_live.py (Versión Corregida)
+# predict_live.py (Versión Sincronizada con el Modelo de Alta Frecuencia)
 
 import yfinance as yf
 import pandas as pd
@@ -6,12 +6,15 @@ from joblib import load
 import logging
 import os
 
-# --- Parámetros de descarga (Sincronizados con train_model.py) ---
+# --- PARÁMETROS SINCRONIZADOS CON EL NUEVO MODELO DE 15 MINUTOS ---
 SYMBOL = "BTC-USD"
-PERIOD = "1y" 
-INTERVAL = "1d" 
+# Usamos '7d' para tener suficientes datos para los indicadores (SMA de 50, etc.)
+# pero sin descargar datos innecesarios en cada ejecución.
+PERIOD = "7d" 
+# ¡CRÍTICO! El intervalo debe ser el mismo que en el entrenamiento.
+INTERVAL = "15m" 
 
-# --- Parámetros de indicadores (Sincronizados con train_model.py) ---
+# Los parámetros de los indicadores son los mismos que en el entrenamiento.
 SMA_SHORT = 20
 SMA_LONG = 50
 RSI_WINDOW = 14
@@ -23,39 +26,30 @@ BB_WINDOW = 20
 ATR_WINDOW = 14
 MOMENTUM_WINDOW = 14
 
-# --- Lista de Features (Debe ser idéntica a la del entrenamiento) ---
+# La lista de features debe ser idéntica.
 FEATURES = [
     'sma_20', 'sma_50', 'rsi', 'macd', 'macd_signal', 'macd_diff', 
     'stochrsi', 'obv', 'bb_width', 'atr', 'momentum', 'contexto_estrategia'
 ]
 
-# --- Ruta del Modelo ---
+# La ruta del modelo no cambia.
 MODEL_PATH = os.path.join("models", "model.joblib")
 
 
 def get_prediction():
     """
-    Ejecuta el pipeline completo de obtención de datos, cálculo de features y
-    predicción del modelo para obtener una señal de trading.
-
-    Returns:
-        int: La predicción del modelo (1 para COMPRA, 0 para VENTA).
-
-    Raises:
-        FileNotFoundError: Si no se encuentra el archivo del modelo.
-        ConnectionError: Si falla la descarga de datos de yfinance.
-        ValueError: Si el DataFrame queda vacío tras la limpieza.
+    Obtiene la predicción del modelo de ALTA FRECUENCIA para la vela más reciente.
     """
-    logging.info(f"📥 [Predicción] Descargando datos para {SYMBOL}...")
+    logging.info(f"📥 [Predicción AF] Descargando datos para {SYMBOL} (Intervalo: {INTERVAL})...")
     
-    # 1. DESCARGA DE DATOS (LÍNEA CORREGIDA)
+    # 1. DESCARGA DE DATOS
     df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, auto_adjust=True, progress=False)
     if df.empty:
-        logging.error("❌ [Predicción] No se pudieron descargar datos.")
+        logging.error("❌ [Predicción AF] No se pudieron descargar datos.")
         raise ConnectionError("Fallo en la descarga de datos desde yfinance.")
 
-    # 2. CÁLCULO DE FEATURES
-    logging.info("⚙️ [Predicción] Calculando features técnicas...")
+    # 2. CÁLCULO DE FEATURES (Lógica idéntica al entrenamiento)
+    logging.info("⚙️ [Predicción AF] Calculando features técnicas...")
     # --- SMAs ---
     df['sma_20'] = df['Close'].rolling(window=SMA_SHORT).mean()
     df['sma_50'] = df['Close'].rolling(window=SMA_LONG).mean()
@@ -97,30 +91,23 @@ def get_prediction():
     # 3. LIMPIEZA Y PREPARACIÓN
     df.dropna(inplace=True)
     if df.empty:
-        logging.error("❌ [Predicción] DataFrame vacío después de la limpieza. Aumentar el período de descarga podría ayudar.")
         raise ValueError("DataFrame vacío después de limpiar NaNs en el módulo de predicción.")
 
     X = df[FEATURES]
     
-    # 4. CARGA DEL MODELO
-    if not os.path.exists(MODEL_PATH):
-        logging.error(f"❌ [Predicción] No se encontró el modelo en '{MODEL_PATH}'.")
-        raise FileNotFoundError(f"El archivo del modelo no se encuentra en {MODEL_PATH}")
-    
+    # 4. CARGA Y PREDICCIÓN
     model = load(MODEL_PATH)
-    
-    # 5. PREDICCIÓN
     latest_data = X.tail(1)
     prediction = model.predict(latest_data)[0]
     
-    logging.info(f"🤖 [Predicción] El modelo predice la clase: {prediction}")
+    logging.info(f"🤖 [Predicción AF] El modelo predice la clase para la próxima vela de 15m: {prediction}")
     return int(prediction)
 
 
 # Este bloque permite ejecutar el script directamente para hacer una prueba rápida.
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s")
-    print("--- Ejecutando predict_live.py en modo de prueba ---")
+    print("--- Ejecutando predict_live.py (Modo Alta Frecuencia) en modo de prueba ---")
     try:
         final_signal = get_prediction()
         if final_signal == 1:

@@ -1,7 +1,8 @@
+# train_model.py (Versión de Alta Frecuencia - 15m)
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import ta
 import json
 from datetime import datetime
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
@@ -11,71 +12,91 @@ import joblib
 import os
 import matplotlib.pyplot as plt
 
+# --- PARÁMETROS DEL MODELO DE ALTA FRECUENCIA ---
+# Símbolo a descargar
+TICKER = 'BTC-USD'
+# Período de datos. '60d' (60 días) es el máximo permitido por yfinance para intervalos de 15m.
+PERIODO_DATOS = '60d'
+# Intervalo de velas: 15 minutos para operaciones intradiarias.
+INTERVALO_VELAS = '15m'
+
 def train_ia_model():
-    print("Paso 1: Descargando datos históricos de BTC-USD...")
+    """
+    Entrena un modelo de IA de alta frecuencia para predecir movimientos de precios
+    en velas de 15 minutos.
+    """
+    print(f"--- Fase 1: Entrenamiento del Modelo de Alta Frecuencia ({INTERVALO_VELAS}) ---")
+    
+    # --- PASO 1: Descarga de Datos de Alta Frecuencia ---
+    print(f"Paso 1: Descargando datos históricos para {TICKER} (Período: {PERIODO_DATOS}, Intervalo: {INTERVALO_VELAS})...")
     try:
-        data = yf.download('BTC-USD', period='5y', interval='1d', auto_adjust=True, progress=False)
+        data = yf.download(TICKER, period=PERIODO_DATOS, interval=INTERVALO_VELAS, auto_adjust=True, progress=False)
         if data.empty:
-            raise ValueError("No se pudieron descargar datos.")
-        print("✅ Datos descargados correctamente.")
+            raise ValueError("No se pudieron descargar datos. Verifica el ticker o el período.")
+        print(f"✅ Datos descargados correctamente. {len(data)} velas de {INTERVALO_VELAS} obtenidas.")
     except Exception as e:
         print(f"❌ Error al descargar datos: {e}")
         return
 
+    # --- PASO 2: Cálculo de Indicadores Técnicos con Pandas (Versión Robusta) ---
     print("Paso 2: Calculando indicadores técnicos...")
-
-    close = pd.Series(data['Close'].to_numpy().ravel(), index=data.index)
-    high = pd.Series(data['High'].to_numpy().ravel(), index=data.index)
-    low = pd.Series(data['Low'].to_numpy().ravel(), index=data.index)
-    volume = pd.Series(data['Volume'].to_numpy().ravel(), index=data.index)
-
-    data['sma_20'] = ta.trend.SMAIndicator(close=close, window=20).sma_indicator()
-    data['sma_50'] = ta.trend.SMAIndicator(close=close, window=50).sma_indicator()
-    data['rsi'] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
-
-    macd = ta.trend.MACD(close=close)
-    data['macd'] = macd.macd()
-    data['macd_signal'] = macd.macd_signal()
-    data['macd_diff'] = macd.macd_diff()
-
-    data['stochrsi'] = ta.momentum.StochRSIIndicator(close=close, window=14).stochrsi()
-    data['obv'] = ta.volume.OnBalanceVolumeIndicator(close=close, volume=volume).on_balance_volume()
-    data['bb_width'] = ta.volatility.BollingerBands(close=close, window=20).bollinger_wband()
-    data['atr'] = ta.volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
-    data['momentum'] = close - close.shift(14)
+    
+    # Los parámetros de los indicadores se mantienen, pero ahora se aplican a velas de 15m.
+    # --- SMAs ---
+    data['sma_20'] = data['Close'].rolling(window=20).mean()
+    data['sma_50'] = data['Close'].rolling(window=50).mean()
+    # --- RSI ---
+    delta = data['Close'].diff(1)
+    gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(com=14 - 1, min_periods=14).mean()
+    avg_loss = loss.ewm(com=14 - 1, min_periods=14).mean()
+    data['rsi'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
+    # --- MACD ---
+    ema_fast = data['Close'].ewm(span=12, adjust=False).mean()
+    ema_slow = data['Close'].ewm(span=26, adjust=False).mean()
+    data['macd'] = ema_fast - ema_slow
+    data['macd_signal'] = data['macd'].ewm(span=9, adjust=False).mean()
+    data['macd_diff'] = data['macd'] - data['macd_signal']
+    # --- Stochastic RSI ---
+    rsi_series = data['rsi']
+    min_rsi = rsi_series.rolling(window=14).min(); max_rsi = rsi_series.rolling(window=14).max()
+    data['stochrsi'] = (rsi_series - min_rsi) / (max_rsi - min_rsi)
+    # --- On-Balance Volume (OBV) ---
+    data['obv'] = (data['Volume'] * (~data['Close'].diff().le(0) * 2 - 1)).cumsum()
+    # --- Bollinger Bands Width ---
+    sma_bb = data['Close'].rolling(window=20).mean()
+    std_bb = data['Close'].rolling(window=20).std()
+    upper_bb = sma_bb + (std_bb * 2); lower_bb = sma_bb - (std_bb * 2)
+    data['bb_width'] = (upper_bb - lower_bb) / sma_bb
+    # --- Average True Range (ATR) ---
+    high_low = data['High'] - data['Low']
+    high_close = (data['High'] - data['Close'].shift()).abs()
+    low_close = (data['Low'] - data['Close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    data['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    # --- Momentum ---
+    data['momentum'] = data['Close'].diff(14)
+    # --- Contexto --- (Se mantiene como placeholder, ya que es menos relevante en alta frecuencia)
+    data["contexto_estrategia"] = 0
 
     print("✅ Indicadores técnicos calculados.")
 
-    print("Paso 3: Limpiando NaNs...")
+    # --- PASO 3: Limpieza y Creación de la Variable Objetivo ---
+    print("Paso 3: Limpiando NaNs y creando la variable objetivo (target)...")
+    
+    # La variable objetivo ahora predice si la *próxima vela de 15 minutos* subirá o bajará.
+    price_diff = data['Close'].shift(-1) - data['Close']
+    data['target'] = np.where(price_diff > 0, 1, 0) # Simplificado a 1 si sube, 0 si baja o es igual
+    
     data.dropna(inplace=True)
     if data.empty:
         print("❌ Error: El DataFrame quedó vacío tras limpiar NaNs.")
         return
 
-    data['Date'] = data.index
+    print("✅ Distribución de clases (1: Sube, 0: Baja):")
+    print(data['target'].value_counts(normalize=True))
 
-    print("Paso 4: Incorporando estrategias de contexto...")
-    try:
-        contexto_df = pd.read_csv("data/estrategias_contexto.csv")
-        contexto_df = contexto_df[contexto_df["fecha"] != "sin_fecha"]
-        contexto_df["fecha"] = pd.to_datetime(contexto_df["fecha"])
-        data["Date"] = pd.to_datetime(data["Date"])
-        data = data.merge(contexto_df[["fecha", "tipo"]], left_on="Date", right_on="fecha", how="left")
-        data["contexto_estrategia"] = data["tipo"].notnull().astype(int)
-        data.drop(columns=["fecha", "tipo"], inplace=True)
-        print("✅ Contexto incorporado.")
-    except FileNotFoundError:
-        print("⚠️  Advertencia: No se encontró 'estrategias_contexto.csv'. Se continuará sin contexto.")
-        data["contexto_estrategia"] = 0
-
-    print("Paso 5: Creando variable objetivo binaria (sube/baja)...")
-    price_diff = data['Close'].shift(-1) - data['Close']
-    data['target'] = np.where(price_diff > 0, 1, np.where(price_diff < 0, 0, np.nan))
-    data.dropna(inplace=True)
-
-    print("✅ Distribución de clases:")
-    print(data['target'].value_counts())
-
+    # --- PASO 4: Entrenamiento del Modelo ---
     features = [
         'sma_20', 'sma_50', 'rsi', 'macd', 'macd_signal', 'macd_diff',
         'stochrsi', 'obv', 'bb_width', 'atr', 'momentum', 'contexto_estrategia'
@@ -83,83 +104,48 @@ def train_ia_model():
     X = data[features]
     y = data['target']
 
-    print("Paso 6: Configurando validación cruzada temporal...")
+    print("Paso 4: Configurando y ejecutando la búsqueda de hiperparámetros (GridSearchCV)...")
     tscv = TimeSeriesSplit(n_splits=5)
-
-    print("Paso 7: Buscando hiperparámetros óptimos (GridSearchCV)...")
+    
+    # Reducimos un poco la complejidad para un entrenamiento más rápido
     param_grid = {
         'n_estimators': [100, 200],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1],
-        'subsample': [0.8, 1.0],
-        'colsample_bytree': [0.8, 1.0]
+        'max_depth': [3, 5],
+        'learning_rate': [0.05, 0.1],
+        'subsample': [0.8, 0.9]
     }
 
     grid_search = GridSearchCV(
-        estimator=XGBClassifier(
-            objective='binary:logistic',
-            eval_metric='logloss',
-            use_label_encoder=False,
-            random_state=42
-        ),
-        param_grid=param_grid,
-        cv=tscv,
-        n_jobs=-1,
-        verbose=2,
-        scoring='accuracy'
+        estimator=XGBClassifier(objective='binary:logistic', eval_metric='logloss', use_label_encoder=False, random_state=42),
+        param_grid=param_grid, cv=tscv, n_jobs=-1, verbose=1, scoring='accuracy'
     )
-
     grid_search.fit(X, y)
     model = grid_search.best_estimator_
 
-    print("\n✅ Resultados GridSearchCV:")
-    print("🔍 Mejores parámetros encontrados:", grid_search.best_params_)
-    print("✅ Mejor puntuación (accuracy):", grid_search.best_score_)
+    print("\n✅ Resultados de GridSearchCV:")
+    print(f"🔍 Mejores parámetros encontrados: {grid_search.best_params_}")
+    print(f"🎯 Mejor puntuación de validación cruzada (accuracy): {grid_search.best_score_:.4f}")
 
-    # 🧠 Tip adicional: Guardar los mejores parámetros
+    # --- PASO 5: Evaluación y Guardado ---
+    print("Paso 5: Evaluando y guardando el nuevo modelo de alta frecuencia...")
     os.makedirs("models", exist_ok=True)
-    with open("models/best_params.json", "w") as f:
-        json.dump(grid_search.best_params_, f)
-
-    print("Paso 8: Importancia de variables...")
-    importances = model.feature_importances_
-    feature_series = pd.Series(importances, index=features).sort_values(ascending=False)
-
-    plt.figure(figsize=(10, 6))
-    feature_series.plot(kind='bar', title='Importancia de Features del Modelo')
-    plt.ylabel('Importancia')
-    plt.tight_layout()
-    plt.savefig('feature_importance.png')
-    print("✅ Gráfico guardado como 'feature_importance.png'.")
-
-    print("Paso 9: Evaluación final sobre todos los datos...")
-    y_pred = model.predict(X)
-    accuracy = accuracy_score(y, y_pred)
-    print(f"✅ Precisión final sobre el dataset completo: {accuracy:.4f}")
-
-    print("Paso 10: Guardando modelo y log...")
     joblib.dump(model, "models/model.joblib")
 
+    y_pred = model.predict(X)
+    final_accuracy = accuracy_score(y, y_pred)
+    print(f"✅ Precisión final sobre todo el dataset de entrenamiento: {final_accuracy:.4f}")
+    
     log_entry = {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'model_type': 'binary',
+        'model_type': f'High-Frequency ({INTERVALO_VELAS})',
         'best_cv_accuracy': round(grid_search.best_score_, 4),
-        'final_accuracy_on_full_data': round(accuracy, 4),
+        'final_accuracy_on_full_data': round(final_accuracy, 4),
         'best_params': grid_search.best_params_
     }
+    with open('training_log.json', 'a') as f:
+        f.write(json.dumps(log_entry) + "\n")
 
-    log_file = 'training_log.json'
-    try:
-        with open(log_file, 'r') as f:
-            logs = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        logs = []
-
-    logs.append(log_entry)
-    with open(log_file, 'w') as f:
-        json.dump(logs, f, indent=4)
-
-    print("✅ Entrenamiento completado y modelo guardado correctamente.")
+    print("\n✅ ¡Entrenamiento del modelo de alta frecuencia completado! El archivo 'models/model.joblib' ha sido actualizado.")
 
 if __name__ == '__main__':
     train_ia_model()
