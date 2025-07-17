@@ -1,62 +1,78 @@
-import requests
+# youtube_scraper/get_video_ids.py (Versión Centrada en Fuentes Confiables)
+
 import os
+import logging
+from googleapiclient.discovery import build
 from dotenv import load_dotenv
 
-# ✅ Cargar API_KEY desde .env
-load_dotenv()
-API_KEY = os.getenv("API_KEY")
-CHANNEL_ID = "UC1AZPvFr6v1WZaPw_YX19DA"  # ← Cambia esto si necesitas otro canal
+# --- Importamos nuestra lista de fuentes desde el script de análisis ---
+# Esto asegura que ambos scripts siempre estén sincronizados.
+from analizar_transcripciones import FUENTES_PONDERADAS
 
-KEYWORDS = [
-    "estrategia", "scalping", "day trading", "curso", "guía", "desde cero", 
-    "para principiantes", "psicotrading", "gestión de riesgo", "plan de trading",
-    "mejor indicador", "indicador oculto", "rsi", "macd", "estocástico",
-    "99% de aciertos", "trading rentable"
-]
+# --- Configuración ---
+OUTPUT_FILE = os.path.join('youtube_scraper', 'videos_filtrados.txt')
 
-def contiene_palabras_clave(titulo):
-    titulo_lower = titulo.lower()
-    return any(keyword in titulo_lower for keyword in KEYWORDS)
-
-def get_video_ids(api_key, channel_id):
-    base_url = "https://www.googleapis.com/youtube/v3/search"
-    video_ids = []
-    page_token = ""
+def get_video_ids_from_channels():
+    """
+    Se conecta a la API de YouTube, busca los videos más recientes de los canales
+    predefinidos en FUENTES_PONDERADAS y guarda sus IDs.
+    """
+    logging.info("🔎 [YouTube Scraper] Iniciando búsqueda de videos de canales de confianza...")
     
-    while True:
-        params = {
-            "key": api_key,
-            "channelId": channel_id,
-            "part": "snippet",
-            "order": "date",
-            "maxResults": 50,
-            "pageToken": page_token,
-            "type": "video"
-        }
+    # --- Cargar la API Key de YouTube de forma segura ---
+    # Asumimos que la clave está en el .env de la raíz del proyecto.
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dotenv_path = os.path.join(project_root, '.env')
+    load_dotenv(dotenv_path=dotenv_path)
 
-        response = requests.get(base_url, params=params)
-        data = response.json()
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        logging.error("❌ [YouTube Scraper] YOUTUBE_API_KEY no encontrada en el archivo .env. No se pueden buscar videos.")
+        return
 
-        for item in data.get("items", []):
-            video_id = item["id"]["videoId"]
-            titulo = item["snippet"]["title"]
+    try:
+        youtube_service = build('youtube', 'v3', developerKey=api_key)
+        
+        video_ids_encontrados = []
+        
+        # --- Iterar sobre nuestra lista de canales de confianza ---
+        for channel_id, info in FUENTES_PONDERADAS.items():
+            logging.info(f"  -> Buscando videos recientes del canal: {info['nombre']}...")
+            
+            # 1. Buscar los uploads recientes de un canal por su ID
+            request = youtube_service.search().list(
+                part="snippet",
+                channelId=channel_id,
+                maxResults=2,  # Tomamos los 2 videos más recientes para mantener el análisis fresco
+                order="date",    # Ordenar por fecha para obtener los últimos
+                type="video"
+            )
+            response = request.execute()
+            
+            # 2. Extraer los IDs de los videos encontrados
+            for item in response.get('items', []):
+                video_id = item.get('id', {}).get('videoId')
+                if video_id:
+                    video_ids_encontrados.append(video_id)
+                    logging.info(f"    -> Video encontrado: {item['snippet']['title']} (ID: {video_id})")
 
-            if contiene_palabras_clave(titulo):
-                print(f"✅ Aceptado: {titulo}")
-                video_ids.append(video_id)
-            else:
-                print(f"❌ Ignorado: {titulo}")
+        if not video_ids_encontrados:
+            logging.warning("⚠️ [YouTube Scraper] No se encontraron videos nuevos en los canales especificados.")
+            return
 
-        if "nextPageToken" not in data:
-            break
-        page_token = data["nextPageToken"]
+        # --- Guardar los IDs en el archivo ---
+        with open(OUTPUT_FILE, 'w') as f:
+            for video_id in video_ids_encontrados:
+                f.write(f"{video_id}\n")
+        
+        logging.info(f"✅ [YouTube Scraper] Búsqueda completada. {len(video_ids_encontrados)} IDs de video guardados en '{OUTPUT_FILE}'.")
 
-    return video_ids
+    except Exception as e:
+        logging.error(f"❌ [YouTube Scraper] Ocurrió un error al contactar la API de YouTube: {e}")
+        # Esto puede pasar si se excede la cuota de la API.
+        
 
-# 🎯 Ejecutar y guardar resultados
-if __name__ == "__main__":
-    ids_valiosos = get_video_ids(API_KEY, CHANNEL_ID)
-    with open("videos_filtrados.txt", "w") as f:
-        for vid in ids_valiosos:
-            f.write(f"{vid}\n")
-    print(f"\n🎯 Se guardaron {len(ids_valiosos)} videos valiosos en videos_filtrados.txt")
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s")
+    print("\n--- Ejecutando el recolector de videos de 'Top Traders' en modo de prueba ---")
+    get_video_ids_from_channels()
