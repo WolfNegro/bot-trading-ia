@@ -129,7 +129,9 @@ def train_ia_model():
     # --- PASO 5: Evaluación y Guardado ---
     print("Paso 5: Evaluando y guardando el nuevo modelo de alta frecuencia...")
     os.makedirs("models", exist_ok=True)
-    joblib.dump(model, "models/model.joblib")
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(project_root, "models", "model.joblib")
+    joblib.dump(model, model_path)
 
     y_pred = model.predict(X)
     final_accuracy = accuracy_score(y, y_pred)

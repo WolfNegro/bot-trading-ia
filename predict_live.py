@@ -33,7 +33,8 @@ FEATURES = [
 ]
 
 # La ruta del modelo no cambia.
-MODEL_PATH = os.path.join("models", "model.joblib")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "model.joblib")
 
 
 def get_prediction():
