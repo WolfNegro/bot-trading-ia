@@ -1,40 +1,48 @@
-# run_bot_cycle.py (Versión Final con Importaciones Explícitas)
+# run_bot_cycle.py (Versión Final - Robusta para Cron)
 
 import logging
 import asyncio
 import sys
 import os
 
-# No necesitamos modificar el sys.path con este método más limpio.
+# Añadimos la raíz del proyecto para que encuentre los módulos
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PROJECT_ROOT)
 
-# --- Importaciones Explícitas y Robustas ---
-# Le decimos a Python que busque en la carpeta 'youtube_scraper' el módulo 'get_video_ids'
-from youtube_scraper.get_video_ids import get_video_ids_from_channels
-from youtube_scraper.download_transcripts import download_transcripts_from_csv
+# Apuntamos a la función principal de nuestro bot de operaciones REALES
+from scripts.real_time_bot import run_real_bot_cycle
 
-# Como paper_trading_bot.py está en la misma carpeta (raíz), se importa directamente.
-from paper_trading_bot import main as run_trading_bot
-
-# Configuración básica de logging para este script maestro
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - [ORQUESTADOR] %(message)s")
-
-def run_intelligence_pipeline():
-    """
-    Ejecuta la secuencia completa de recolección de inteligencia social.
-    """
-    logging.info("--- INICIANDO PIPELINE DE INTELIGENCIA (YouTube) ---")
-    get_video_ids_from_channels()
-    download_transcripts_from_csv()
-    logging.info("--- PIPELINE DE INTELIGENCIA COMPLETADO ---")
+# Configuración de logging para este script maestro
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] - [ORQUESTADOR] %(message)s"
+)
 
 async def main_pipeline():
-    """Función principal asíncrona que ejecuta todo en orden."""
-    run_intelligence_pipeline()
-    await run_trading_bot()
+    """Función principal que ejecuta el ciclo del bot real."""
+    
+    # --- INICIO DE LA CORRECCIÓN ---
+    # Construimos la ruta ABSOLUTA al archivo del bot real
+    real_bot_path = os.path.join(PROJECT_ROOT, 'scripts', 'real_time_bot.py')
+    
+    # Leemos el archivo usando la ruta absoluta para determinar el entorno
+    try:
+        with open(real_bot_path, 'r') as f:
+            content = f.read()
+        env = "Testnet" if "USE_TESTNET = True" in content else "Entorno REAL"
+    except FileNotFoundError:
+        logging.error(f"❌ No se pudo encontrar el archivo del bot en {real_bot_path}")
+        env = "Desconocido"
+    # --- FIN DE LA CORRECCIÓN ---
+
+    logging.info(f"--- Iniciando el ciclo de operación del Bot REAL ({env}) ---")
+    await run_real_bot_cycle()
+    logging.info("--- Ciclo de operación REAL completado ---")
 
 if __name__ == '__main__':
-    logging.info("🚀 Invocando el ciclo completo del Bot de Trading IA...")
-    
-    asyncio.run(main_pipeline())
-    
-    logging.info("✅ Ciclo completo ejecutado.")
+    logging.info("🚀 Invocando el ciclo completo del Bot de Trading IA (Modo Real)...")
+    try:
+        asyncio.run(main_pipeline())
+        logging.info("✅ Ciclo completo (Real) ejecutado exitosamente.")
+    except Exception as e:
+        logging.error(f"❌ Error fatal en el orquestador: {e}", exc_info=True)

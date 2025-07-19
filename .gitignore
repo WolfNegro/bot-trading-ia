@@ -12,10 +12,18 @@ __pycache__/
 .vscode/
 .idea/
 
-# Archivos sensibles
+# Archivos sensibles y generados
 .env
 *.log
 portfolio_state.json
+trade_state.json
+credenciales.json
 
-# Archivos generados
+# Archivos y carpetas generadas
 output/
+data/
+models/
+logs/
+
+# Carpetas temporales o de exportación
+export_txt/

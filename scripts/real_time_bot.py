@@ -1,165 +1,192 @@
-# scripts/real_time_bot.py
+# scripts/real_time_bot.py (Versión 2.2 - Con Heartbeat de Telegram)
 
+import logging
 import os
-import time
-import pandas as pd
-import yfinance as yf
-import ta
-import joblib
-from datetime import datetime
-from dotenv import load_dotenv
-from binance.client import Client
+import sys
+import asyncio
+import json
+from decimal import Decimal, ROUND_DOWN
+from binance.exceptions import BinanceAPIException
 
-# --- Configuración ---
-load_dotenv()
-USE_BINANCE = True  # 🔁 Cambia a False para simular sin operar
+# --- Añadir la raíz del proyecto al path ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
 
-# Conexión Binance
-if USE_BINANCE:
-    api_key = os.getenv("BINANCE_API_KEY")
-    api_secret = os.getenv("BINANCE_API_SECRET")
-    client = Client(api_key, api_secret)
+# --- Importamos NUESTROS módulos ---
+from predict_live import get_prediction
+from scripts.intelligence_aggregator import get_all_sentiment_signals
+from scripts.connect_binance import get_binance_client
+# --- ¡IMPORTAMOS LA NUEVA FUNCIÓN DE FORMATO! ---
+from scripts.notifier import send_telegram_message, format_buy_message, format_sell_message, format_cycle_status_message
 
-# --- Rutas y Constantes ---
-MODELS_DIR = 'models'
+# --- INTERRUPTOR DE SEGURIDAD GLOBAL ---
+USE_TESTNET = True
+
+# --- CONFIGURACIÓN DE TRADING ---
+SYMBOL = 'BTCUSDT'
+BASE_ASSET = 'BTC'
+QUOTE_ASSET = 'USDT'
+USDT_PER_TRADE = 20.0
+
+# --- CONFIGURACIÓN DE GESTIÓN DE RIESGO ---
+STOP_LOSS_PERCENT = 1.5
+TAKE_PROFIT_PERCENT = 3.0
+
+# --- Archivo para guardar el estado de la operación ---
+TRADE_STATE_FILE = 'trade_state.json' 
+
+# --- Configuración de Logging ---
 LOGS_DIR = 'logs'
-DATA_DIR = 'data'
-MODEL_PATH = os.path.join(MODELS_DIR, 'model.joblib')
-LOG_FILE_PATH = os.path.join(LOGS_DIR, 'trades.log')
-DATA_FILE_PATH = os.path.join(DATA_DIR, 'btc_data.csv')
-SYMBOL = "BTCUSDT"
-FEATURES = [
-    'sma_20', 'sma_50', 'rsi', 'macd', 'macd_signal', 'macd_diff',
-    'stochrsi', 'obv', 'bb_width', 'atr', 'momentum'
-]
+TRADES_LOG_FILE = os.path.join(LOGS_DIR, 'real_trades.log')
+if not os.path.exists(LOGS_DIR): os.makedirs(LOGS_DIR)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s", handlers=[logging.FileHandler(TRADES_LOG_FILE), logging.StreamHandler()])
 
-bot_state = {
-    "capital": 1000.0,
-    "position_open": False,
-    "btc_amount": 0.0
-}
+# --- Funciones de Gestión de Estado y Órdenes (sin cambios) ---
+def get_trade_state():
+    if not os.path.exists(TRADE_STATE_FILE):
+        return {"in_position": False, "entry_price": 0.0, "stop_loss_price": 0.0, "take_profit_price": 0.0}
+    with open(TRADE_STATE_FILE, 'r') as f:
+        return json.load(f)
 
-def setup_environment():
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    os.makedirs(DATA_DIR, exist_ok=True)
+def save_trade_state(state):
+    with open(TRADE_STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=4)
 
-def load_prediction_model():
-    if not os.path.exists(MODEL_PATH):
-        print(f"❌ Modelo no encontrado en '{MODEL_PATH}'.")
-        return None
+def get_asset_balance(client, asset):
     try:
-        model = joblib.load(MODEL_PATH)
-        print("✅ Modelo de IA cargado exitosamente.")
-        return model
-    except Exception as e:
-        print(f"❌ Error al cargar el modelo: {e}")
-        return None
+        balance = client.get_asset_balance(asset=asset)
+        return Decimal(balance['free'])
+    except BinanceAPIException as e:
+        logging.error(f"❌ Error al obtener balance de {asset}: {e}")
+        return Decimal('0')
 
-def fetch_and_prepare_data():
-    print("Descargando datos recientes (5 días, 15min)...")
+async def execute_real_buy(client, trade_state):
+    logging.info(f"📈 Intentando ejecutar COMPRA de {USDT_PER_TRADE} {QUOTE_ASSET}...")
     try:
-        data = yf.download('BTC-USD', period='5d', interval='15m', auto_adjust=True, progress=False)
-        if data.empty:
-            return None
+        ticker = client.get_symbol_ticker(symbol=SYMBOL)
+        price = Decimal(ticker['price'])
+        quantity = (Decimal(str(USDT_PER_TRADE)) / price).quantize(Decimal('0.00001'), rounding=ROUND_DOWN)
+        
+        logging.info(f"Enviando ORDEN MARKET BUY: {quantity} {BASE_ASSET} a ~${price:.2f}")
+        order = client.order_market_buy(symbol=SYMBOL, quantity=float(quantity))
+        
+        entry_price = Decimal(order['fills'][0]['price'])
+        trade_state.update({
+            "in_position": True,
+            "entry_price": float(entry_price),
+            "stop_loss_price": float(entry_price * (Decimal(1) - Decimal(STOP_LOSS_PERCENT / 100))),
+            "take_profit_price": float(entry_price * (Decimal(1) + Decimal(TAKE_PROFIT_PERCENT / 100)))
+        })
+        save_trade_state(trade_state)
+        logging.info(f"✅ Compra exitosa. Precio de entrada: {entry_price:.2f}, SL: {trade_state['stop_loss_price']:.2f}, TP: {trade_state['take_profit_price']:.2f}")
 
-        close = data['Close'].astype(float)
-        high = data['High'].astype(float)
-        low = data['Low'].astype(float)
-        volume = data['Volume'].astype(float)
-
-        data['sma_20'] = ta.trend.SMAIndicator(close, 20).sma_indicator()
-        data['sma_50'] = ta.trend.SMAIndicator(close, 50).sma_indicator()
-        data['rsi'] = ta.momentum.RSIIndicator(close).rsi()
-        macd = ta.trend.MACD(close)
-        data['macd'] = macd.macd()
-        data['macd_signal'] = macd.macd_signal()
-        data['macd_diff'] = macd.macd_diff()
-        data['stochrsi'] = ta.momentum.StochRSIIndicator(close).stochrsi()
-        data['obv'] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
-        bb = ta.volatility.BollingerBands(close)
-        data['bb_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
-        data['atr'] = ta.volatility.AverageTrueRange(high, low, close).average_true_range()
-        data['momentum'] = close - close.shift(14)
-
-        data.dropna(inplace=True)
-        data.to_csv(DATA_FILE_PATH)
-
-        print("✅ Indicadores calculados.")
-        return data
+        msg = format_buy_message(SYMBOL, trade_state['entry_price'], trade_state['stop_loss_price'], trade_state['take_profit_price'])
+        await send_telegram_message(msg)
+        return True
     except Exception as e:
-        print(f"❌ Error al preparar datos: {e}")
-        return None
+        logging.error(f"❌ Error al ejecutar compra: {e}", exc_info=True)
+        return False
 
-def execute_trade_logic(model, data):
-    if data.empty:
-        print("⚠️ No hay datos para procesar.")
-        return
+async def execute_real_sell(client, trade_state, reason="Señal de Venta"):
+    logging.info(f"📉 Intentando ejecutar VENTA de todo el {BASE_ASSET}...")
+    try:
+        quantity = get_asset_balance(client, BASE_ASSET)
+        if quantity <= Decimal('0.00001'):
+            logging.warning(f"⚠️ Se intentó vender pero el balance de {BASE_ASSET} es cero.")
+            save_trade_state({"in_position": False, "entry_price": 0.0, "stop_loss_price": 0.0, "take_profit_price": 0.0})
+            return False
 
-    features = data[FEATURES].tail(1)
-    prediction = model.predict(features)[0]
-    price = float(data['Close'].iloc[-1])
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        quantity_to_sell = float(quantity.quantize(Decimal('0.00001'), rounding=ROUND_DOWN))
+        logging.info(f"Enviando ORDEN MARKET SELL: {quantity_to_sell} {BASE_ASSET}")
+        order = client.order_market_sell(symbol=SYMBOL, quantity=quantity_to_sell)
+        
+        exit_price = Decimal(order['fills'][0]['price'])
+        pnl = (exit_price - Decimal(str(trade_state.get('entry_price', exit_price)))) * quantity
+        logging.info(f"✅ Venta exitosa. Precio de salida: {exit_price:.2f}. P&L: ${pnl:.2f}")
 
-    print(f"[{now}] Precio: ${price:,.2f} | Predicción: {prediction} (1=BUY, 0=SELL)")
+        msg = format_sell_message(SYMBOL, float(exit_price), reason, float(pnl))
+        await send_telegram_message(msg)
+        
+        save_trade_state({"in_position": False, "entry_price": 0.0, "stop_loss_price": 0.0, "take_profit_price": 0.0})
+        return True
+    except Exception as e:
+        logging.error(f"❌ Error al ejecutar venta: {e}", exc_info=True)
+        return False
 
-    if prediction == 1 and not bot_state['position_open']:
-        btc = bot_state['capital'] / price
-        if USE_BINANCE:
-            try:
-                order = client.order_market_buy(symbol=SYMBOL, quoteOrderQty=bot_state['capital'])
-                print("🟢 ORDEN DE COMPRA REAL enviada a Binance.")
-            except Exception as e:
-                print(f"❌ Falló la orden BUY: {e}")
+# --- Lógica Principal del Bot ---
+async def run_real_bot_cycle():
+    env = "Testnet" if USE_TESTNET else "Entorno REAL"
+    logging.info("="*20 + f" INICIANDO CICLO DEL BOT REAL v2.2 ({env}) " + "="*20)
+    
+    client = get_binance_client(testnet=USE_TESTNET)
+    trade_state = get_trade_state()
+    action_taken = "Manteniendo Posición" # <-- Variable para el estado final
+    score = 0 # <-- Inicializamos el score
+
+    try:
+        # 1. Gestión de posición abierta (SL/TP)
+        if trade_state.get("in_position", False):
+            current_price = Decimal(client.get_symbol_ticker(symbol=SYMBOL)['price'])
+            sl = Decimal(str(trade_state.get('stop_loss_price', 0)))
+            tp = Decimal(str(trade_state.get('take_profit_price', 0)))
+            logging.info(f"🔎 En posición. Precio actual: ${current_price:.2f}. SL: ${sl:.2f}, TP: ${tp:.2f}")
+
+            if sl > 0 and current_price <= sl:
+                logging.warning("🔥 STOP-LOSS ALCANZADO.")
+                if await execute_real_sell(client, trade_state, reason="Stop-Loss"):
+                    action_taken = "Venta por Stop-Loss"
+                # Finalizamos el ciclo aquí porque ya se tomó una acción
+                status_message = format_cycle_status_message(score, action_taken)
+                await send_telegram_message(status_message)
                 return
-        bot_state.update({"btc_amount": btc, "position_open": True, "capital": 0.0})
-        log_trade("BUY", price, btc * price)
-
-    elif prediction == 0 and bot_state['position_open']:
-        usdt = bot_state['btc_amount'] * price
-        if USE_BINANCE:
-            try:
-                order = client.order_market_sell(symbol=SYMBOL, quantity=round(bot_state['btc_amount'], 6))
-                print("🔴 ORDEN DE VENTA REAL enviada a Binance.")
-            except Exception as e:
-                print(f"❌ Falló la orden SELL: {e}")
+            elif tp > 0 and current_price >= tp:
+                logging.info("🎉 TAKE-PROFIT ALCANZADO.")
+                if await execute_real_sell(client, trade_state, reason="Take-Profit"):
+                    action_taken = "Venta por Take-Profit"
+                status_message = format_cycle_status_message(score, action_taken)
+                await send_telegram_message(status_message)
                 return
-        bot_state.update({"capital": usdt, "position_open": False, "btc_amount": 0.0})
-        log_trade("SELL", price, usdt)
-    else:
-        print("⏸ MANTENER (sin cambio de posición)")
+        
+        # 2. Búsqueda de nueva señal si no se ha cerrado una posición
+        logging.info("Buscando nueva señal por confluencia...")
+        tech_prediction = get_prediction()
+        sentiment_signals = get_all_sentiment_signals()
+        
+        # 3. Lógica de puntuación
+        if tech_prediction == 1: score += 2
+        if tech_prediction == 0: score -= 2
+        if sentiment_signals['twitter'] == 1: score += 1.5
+        if sentiment_signals['twitter'] == -1: score -= 1.5
+        if sentiment_signals['fear_and_greed'] == 1: score += 1
+        if sentiment_signals['fear_and_greed'] == -1: score -= 1
+        if sentiment_signals['news'] == 1: score += 0.5
+        if sentiment_signals['news'] == -1: score -= 0.5
+        logging.info(f"🧠 Ponderación de Señales: Técnica={tech_prediction*2}, X={sentiment_signals['twitter']*1.5}, F&G={sentiment_signals['fear_and_greed']*1}, Noticias={sentiment_signals['news']*0.5} --> Score Total: {score:.2f}")
 
-def log_trade(action, price, balance):
-    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    msg = f"Fecha: {ts}, Acción: {action}, Precio: ${price:,.2f}, Saldo tras op: ${balance:,.2f}\n"
-    with open(LOG_FILE_PATH, 'a') as f:
-        f.write(msg)
-    print(msg.strip())
+        # 4. Decisión final de trading
+        in_position_now = get_trade_state().get("in_position", False)
+        if score >= 3.0 and not in_position_now:
+            logging.info(f"✅ UMBRAL DE COMPRA ALCANZADO (Score: {score:.2f}).")
+            if await execute_real_buy(client, get_trade_state()):
+                action_taken = "Orden de COMPRA enviada"
+        elif score <= -3.0 and in_position_now:
+            logging.info(f"🛑 UMBRAL DE VENTA ALCANZADO (Score: {score:.2f}).")
+            if await execute_real_sell(client, get_trade_state(), reason="Señal de Venta por Confluencia"):
+                action_taken = "Orden de VENTA enviada"
+        else:
+            logging.info(f"⏸️ Condición de mercado no concluyente o ya en la posición correcta (Score: {score:.2f}).")
+            # action_taken ya es "Manteniendo Posición" por defecto
 
-# --- Bucle principal ---
-if __name__ == "__main__":
-    setup_environment()
-    model = load_prediction_model()
+    except Exception as e:
+        logging.error(f"❌ Error crítico durante el ciclo del bot: {e}", exc_info=True)
+        action_taken = f"ERROR: {e}"
+    
+    # --- ENVÍO DE NOTIFICACIÓN DE ESTADO FINAL ---
+    status_message = format_cycle_status_message(score, action_taken)
+    await send_telegram_message(status_message)
 
-    if model:
-        while True:
-            try:
-                print("\n" + "="*50)
-                print(f"Iniciando ciclo - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"Estado: Capital=${bot_state['capital']:,.2f}, BTC={bot_state['btc_amount']:.6f}, Posición={bot_state['position_open']}")
+    logging.info("="*28 + " FIN DEL CICLO " + "="*28 + "\n")
 
-                data = fetch_and_prepare_data()
-                if data is not None:
-                    execute_trade_logic(model, data)
-
-                print("Ciclo completo. Esperando 15 minutos...")
-                print("="*50)
-                time.sleep(900)
-            except KeyboardInterrupt:
-                print("\n🛑 Bot detenido por usuario.")
-                break
-            except Exception as e:
-                print(f"❌ Error en el ciclo principal: {e}")
-                time.sleep(60)
-    else:
-        print("⚠️ El modelo no pudo cargarse. Bot abortado.")
+# --- BLOQUE PRINCIPAL ---
+if __name__ == '__main__':
+    asyncio.run(run_real_bot_cycle())

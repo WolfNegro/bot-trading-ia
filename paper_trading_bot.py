@@ -1,17 +1,20 @@
-# paper_trading_bot.py (Versión Definitiva con Notificaciones Telegram Asíncronas)
+# paper_trading_bot.py (Versión 3.1 - Estrategia de Confluencia Total)
 
 import logging
 import json
 import os
 import sys
-import asyncio # <-- Importamos asyncio para poder llamar a nuestro notificador
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 
-# --- Importamos TODOS nuestros módulos ---
+# --- Añadir la raíz del proyecto al path ---
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PROJECT_ROOT)
+
+# --- Importamos NUESTROS módulos ---
 from predict_live import get_prediction
-from youtube_scraper.analizar_transcripciones import get_youtube_sentiment
-from scripts.news_analyzer import get_news_sentiment
+from scripts.intelligence_aggregator import get_all_sentiment_signals # <-- NUEVO RECOLECTOR
 from scripts.connect_binance import get_binance_client
 from scripts.notifier import send_telegram_message, format_buy_message, format_sell_message
 
@@ -35,7 +38,7 @@ if not os.path.exists(LOGS_DIR):
     os.makedirs(LOGS_DIR)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s", handlers=[logging.FileHandler(TRADES_LOG_FILE), logging.StreamHandler()])
 
-# --- Funciones de Gestión de Portafolio ---
+# --- Funciones de Gestión de Portafolio (Sin cambios) ---
 def initialize_portfolio():
     if not os.path.exists(PORTFOLIO_FILE):
         initial_state = {"cash_usd": 1000.0, "asset_holding": 0.0, "in_position": False, "total_trades": 0, "initial_value": 1000.0, "entry_price": 0.0, "stop_loss_price": 0.0, "take_profit_price": 0.0}
@@ -60,7 +63,6 @@ def get_current_price(client, symbol):
         return None
 
 async def execute_paper_buy(state, price):
-    # (Lógica idéntica, solo añadimos la notificación al final)
     amount_to_buy = Decimal(VIRTUAL_USD_PER_TRADE) / price
     state['asset_holding'] = float(amount_to_buy)
     state['cash_usd'] -= VIRTUAL_USD_PER_TRADE
@@ -71,34 +73,28 @@ async def execute_paper_buy(state, price):
     state['take_profit_price'] = float(price * (Decimal(1) + Decimal(TAKE_PROFIT_PERCENT / 100)))
     logging.info(f"📈 COMPRA (simulada) de {float(amount_to_buy):.8f} BTC a ${price:.2f}")
     logging.info(f"🛡️ RIESGO: SL=${state['stop_loss_price']:.2f}, TP=${state['take_profit_price']:.2f}")
-    
-    # --- ENVIAR NOTIFICACIÓN ---
     msg = format_buy_message(SYMBOL_ON_BINANCE, float(price), state['stop_loss_price'], state['take_profit_price'])
     await send_telegram_message(msg)
-    
     return state
 
 async def execute_paper_sell(state, price, reason="Señal de Venta"):
-    # (Lógica idéntica, solo añadimos la notificación al final)
     value_of_sale = Decimal(state['asset_holding']) * price
-    pnl = float(value_of_sale) - (state['asset_holding'] * state['entry_price'])
-    
-    # --- ENVIAR NOTIFICACIÓN ---
+    pnl = float(value_of_sale) - VIRTUAL_USD_PER_TRADE
     msg = format_sell_message(SYMBOL_ON_BINANCE, float(price), reason, pnl)
     await send_telegram_message(msg)
-    
     state['cash_usd'] += float(value_of_sale)
     state['asset_holding'] = 0.0
     state['in_position'] = False
     state['entry_price'] = 0.0
     state['stop_loss_price'] = 0.0
     state['take_profit_price'] = 0.0
-    logging.info(f"📉 VENTA ({reason}) a ${price:.2f}. P&L: ${pnl:.2f}")
+    logging.info(f"📉 VENTA ({reason}) a ${price:.2f}. P&L de la operación: ${pnl:.2f}")
     return state
 
+# --- Lógica Principal del Bot (ESTRATEGIA DE CONFLUENCIA TOTAL) ---
 async def run_bot():
-    """Función principal asíncrona que ejecuta el ciclo del bot."""
-    logging.info("="*20 + " INICIANDO CICLO DEL BOT (CON NOTIFICACIONES) " + "="*20)
+    """Función principal que ejecuta el ciclo del bot."""
+    logging.info("="*20 + " INICIANDO CICLO DEL BOT v3.1 (Confluencia Total) " + "="*20)
     
     state = get_portfolio_state()
     
@@ -112,7 +108,7 @@ async def run_bot():
         logging.error("❌ Abortando ciclo: no se pudo obtener precio.")
         return
 
-    # Prioridad #1: Gestión de posición abierta
+    # Gestión de posición abierta
     if state['in_position']:
         logging.info(f"🔎 En posición. Precio: ${current_price:.2f}. SL: ${state['stop_loss_price']:.2f}, TP: ${state['take_profit_price']:.2f}")
         if current_price <= Decimal(state['stop_loss_price']):
@@ -120,7 +116,6 @@ async def run_bot():
             new_state = await execute_paper_sell(state, current_price, reason="Stop-Loss")
             save_portfolio_state(new_state)
             return
-            
         elif current_price >= Decimal(state['take_profit_price']):
             logging.info("🎉 TAKE-PROFIT ALCANZADO.")
             new_state = await execute_paper_sell(state, current_price, reason="Take-Profit")
@@ -128,36 +123,50 @@ async def run_bot():
             return
             
     # Búsqueda de nueva entrada
-    logging.info("Buscando nueva señal de entrada...")
+    logging.info("Buscando nueva señal de entrada por confluencia...")
     try:
         tech_prediction = get_prediction()
-        youtube_sentiment = get_youtube_sentiment()
-        news_sentiment = get_news_sentiment()
+        sentiment_signals = get_all_sentiment_signals()
     except Exception as e:
-        logging.error(f"❌ Error crítico al obtener señales: {e}")
+        logging.error(f"❌ Error crítico al obtener señales: {e}", exc_info=True)
         return
     
+    # --- NUEVA LÓGICA DE PUNTUACIÓN POR CONFLUENCIA ---
     score = 0
-    if tech_prediction == 1: score += 2; # ... (el resto de la lógica de puntos es igual)
-    if tech_prediction == 0: score -= 2
-    if youtube_sentiment == 1: score += 1
-    if youtube_sentiment == -1: score -= 1
-    if news_sentiment == 1: score += 1
-    if news_sentiment == -1: score -= 1
     
-    sentiment_map = {1: "BULLISH", -1: "BEARISH", 0: "NEUTRAL"}
-    logging.info(f"🧠 Técnica: {tech_prediction} | 📺 Social: {youtube_sentiment} | 📰 Noticias: {news_sentiment} --> Score: {score}")
+    # 1. Señal Técnica (la más importante, peso 2)
+    if tech_prediction == 1: score += 2
+    if tech_prediction == 0: score -= 2
 
-    if score >= 3 and not state['in_position']:
-        logging.info(f"✅ UMBRAL DE COMPRA ALCANZADO (Score: {score}).")
+    # 2. Sentimiento de Expertos (X/Twitter) (peso 1.5)
+    if sentiment_signals['twitter'] == 1: score += 1.5
+    if sentiment_signals['twitter'] == -1: score -= 1.5
+    
+    # 3. Sentimiento de Mercado (F&G) (peso 1)
+    if sentiment_signals['fear_and_greed'] == 1: score += 1
+    if sentiment_signals['fear_and_greed'] == -1: score -= 1
+    
+    # 4. Contexto Fundamental (Noticias) (peso 0.5)
+    if sentiment_signals['news'] == 1: score += 0.5
+    if sentiment_signals['news'] == -1: score -= 0.5
+
+    logging.info(f"🧠 Ponderación de Señales: Técnica={tech_prediction*2}, X={sentiment_signals['twitter']*1.5}, F&G={sentiment_signals['fear_and_greed']*1}, Noticias={sentiment_signals['news']*0.5} --> Score Total: {score:.2f}")
+
+    # Umbral de decisión (lo ajustamos a 3.0 para buscar una fuerte confluencia)
+    if score >= 3.0 and not state['in_position']:
+        logging.info(f"✅ UMBRAL DE COMPRA ALCANZADO (Score: {score:.2f}). Ejecutando compra...")
         new_state = await execute_paper_buy(state, current_price)
         save_portfolio_state(new_state)
+    elif score <= -3.0 and state['in_position']:
+        logging.info(f"🛑 UMBRAL DE VENTA ALCANZADO (Score: {score:.2f}). Ejecutando venta por señal...")
+        new_state = await execute_paper_sell(state, current_price, reason="Señal de Venta por Confluencia")
+        save_portfolio_state(new_state)
     else:
-        logging.info(f"⏸️ Umbral de compra no alcanzado o ya en posición (Score: {score}).")
+        logging.info(f"⏸️ Condición de mercado no concluyente o ya en la posición correcta (Score: {score:.2f}). Manteniendo posición.")
 
     logging.info("="*28 + " FIN DEL CICLO " + "="*28 + "\n")
 
-# --- BLOQUE PRINCIPAL ASÍNCRONO ---
+# --- BLOQUE PRINCIPAL (Sin cambios) ---
 async def main():
     if os.path.exists(LOCK_FILE):
         logging.warning("✋ Bot ya en ejecución (bot.lock existe). Saliendo.")
@@ -165,7 +174,6 @@ async def main():
     try:
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
-        
         initialize_portfolio()
         await run_bot()
     finally:
